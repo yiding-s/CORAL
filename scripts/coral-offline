@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Start a CORAL run with opencode + OpenRouter, network locked down by the srt
+# sandbox: agents can reach only the model API.
+#
+#   scripts/coral-offline examples/math/heilbronn_triangle/task.yaml [key=value ...]
+#
+# Task paths are relative to this repo. Results go to <repo>/results/<task>/<time>/.
+# Model: CORAL_MODEL (default openrouter/deepseek/deepseek-v4.1-flash-1017).
+# Key:   OPENROUTER_API_KEY, or ~/.config/openrouter.env exporting it.
+#
+# Needs on the host: opencode, srt (npm i -g @anthropic-ai/sandbox-runtime),
+# bwrap, socat, rg. Without sudo, socat/rg can come from a conda env; set
+# CORAL_SANDBOX_EXTRA_READ to that env so the sandbox can read it.
+set -euo pipefail
+
+CORAL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+MODEL="${CORAL_MODEL:-openrouter/deepseek/deepseek-v4.1-flash-1017}"
+
+if [ $# -lt 1 ]; then
+  echo "usage: scripts/coral-offline <task.yaml> [key=value overrides...]" >&2
+  exit 2
+fi
+task="$1"; shift
+
+[ -f ~/.config/openrouter.env ] && . ~/.config/openrouter.env
+if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+  echo "OPENROUTER_API_KEY is not set (export it, or put it in ~/.config/openrouter.env)" >&2
+  exit 1
+fi
+
+# Readable inside the sandbox. srt denies all of $HOME; this repo's .venv
+# links to its base interpreter, so that interpreter's prefix must be allowed.
+allow=()
+base_py="$(readlink -f "$CORAL_DIR/.venv/bin/python" 2>/dev/null || true)"
+if [ -n "$base_py" ]; then
+  prefix="$(dirname "$(dirname "$base_py")")"
+  case "$prefix" in
+    "$HOME"/.local/*) ;;  # already readable (uv-managed pythons)
+    "$HOME"/*) allow+=("$prefix/bin" "$prefix/lib") ;;
+  esac
+fi
+for p in ${CORAL_SANDBOX_EXTRA_READ:-$HOME/anaconda3/envs/coral-sandbox}; do
+  [ -e "$p" ] && allow+=("$p")
+done
+
+# Hidden inside the sandbox. Each entry is denied one by one: denying an
+# ancestor of the agent worktree makes bwrap fail to start it, and `latest`
+# symlinks point at the new run, so symlinks are skipped.
+deny=()
+shopt -s dotglob nullglob
+# 1. Earlier runs of this repo (their solutions).
+for d in "$CORAL_DIR"/results/*/*/; do
+  d="${d%/}"
+  [ -d "$d" ] && [ ! -L "$d" ] && deny+=("$d")
+done
+# 2. Everything on the same top-level mount (e.g. /data) that is not on the
+#    path to this repo: other users, the user's other projects.
+IFS=/ read -r -a parts <<< "${CORAL_DIR#/}"
+path=""
+for ((i = 0; i < ${#parts[@]}; i++)); do
+  parent="${path:-/}"
+  path="$path/${parts[$i]}"
+  [ $i -eq 0 ] && continue  # never deny siblings of the top level (/usr, /home, ...)
+  for d in "$parent"/*; do
+    [ "$d" = "$path" ] || [ -L "$d" ] || deny+=("$d")
+  done
+done
+shopt -u dotglob nullglob
+
+join() { local IFS=,; echo "$*"; }
+sandbox_args=()
+[ ${#allow[@]} -gt 0 ] && sandbox_args+=("agents.sandbox.allow_read=[$(join "${allow[@]}")]")
+[ ${#deny[@]} -gt 0 ] && sandbox_args+=("agents.sandbox.deny_read=[$(join "${deny[@]}")]")
+
+cd "$CORAL_DIR"
+exec uv run coral start -c "$task" \
+  agents.runtime=opencode \
+  "agents.model=$MODEL" \
+  agents.gateway.enabled=false \
+  run.session=local \
+  agents.sandbox.enabled=true \
+  agents.sandbox.network=allowlist \
+  "agents.sandbox.allowed_domains=[openrouter.ai,models.opencode.ai]" \
+  "${sandbox_args[@]}" \
+  "$@"
